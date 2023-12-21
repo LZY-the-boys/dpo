@@ -19,7 +19,7 @@ from typing import List, Literal, Optional
 from datasets import DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 from datasets.builder import DatasetGenerationError
 
-from .configs import DataArguments
+from configs import DataArguments
 
 
 DEFAULT_CHAT_TEMPLATE = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
@@ -82,11 +82,14 @@ def apply_chat_template(
         raise ValueError(
             f"Task {task} not supported, please ensure that the provided task is one of {['sft', 'generation', 'rm', 'dpo']}"
         )
+    # 'text_prompt': '<|system|>\n<|endoftext|>\n<|user|>\nHave you seen the film Condorman?<|endoftext|>\n<|assistant|>\n'
+    # 'text_chosen': 'I\'m an AI language model, and I don\'t "see" films or any other content in the same way humans do. However, I can provide information about the film you mentioned. "Condorman" is a 1981 American adventure comedy film produced by Walt Disney Productions. It is based on the comic book series "Condorman" by Robert M. Arthur Jr., and it was directed by Charles Jarrott. The film stars Michael Crawford as the title character, a comic book artist and inventor who creates a superhero persona to save a Soviet scientist and her secrets from being captured by the KGB. The movie received mixed reviews and was not a huge success commercially, but it has gained a cult following over the years.<|endoftext|>\n'
+    # 'text_rejected': "Yes, I have seen the film Condorman. It is a 1981 animated adventure film based on the DC Comics character Condorman, a teenage superhero who wears a condor-inspired suit. The film follows the story of a high school student named Woody who becomes the title character when his invention is stolen by a group of villains. With the help of his friends and the unlikely mentor named NASA scientist Dr. Stuart, Woody must save the world from the enemy's evil plan. The film features the voices of John Candy, Graham Greene, and Nancy Cartwright.<|endoftext|>\n",
     return example
 
 
 def get_datasets(
-    data_config: DataArguments | dict,
+    data_config,
     splits: List[str] = ["train", "test"],
     shuffle: bool = True,
 ) -> DatasetDict:
