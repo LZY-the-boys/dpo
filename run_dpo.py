@@ -25,133 +25,330 @@ from data import apply_chat_template, get_datasets
 from model_utils import get_kbit_device_map, get_peft_config, is_adapter_model, DEFAULT_CHAT_TEMPLATE
 from peft import PeftConfig, PeftModel
 from trl import DPOTrainer
+import datasets
+from itertools import combinations
+from collections import defaultdict
+import numpy as np
 
-
+IGNORE_TOKEN_ID = -100
+preprocessing_num_workers = 1
 logger = logging.getLogger(__name__)
 
-def tokenize_row_without_bos(self, feature, model = None) :
+def process_ultrachat(example):
+    for data in [ example['chosen'], example['rejected'] ]:
+        for d in data:
+            d['value'] = d['content']
+            del d['content']
+            d['from'] = d['role']
+            del d['role']
+    return example
+
+def process_intel_orca(example):
+    return {
+        'prompt': example['question'],
+        'chosen': [
+            {
+                "from": "system",
+                "value": example['system'],
+            },
+            {
+                "from": "user",
+                "value": example['question'],
+            },
+            {
+                "from": "assistant",
+                "value": example['chosen'],
+            },
+        ],
+        'rejected': [
+            {
+                "from": "system",
+                "value": example['system'],
+            },
+            {
+                "from": "user",
+                "value": example['question'],
+            },
+            {
+                "from": "assistant",
+                "value": example['rejected'],
+            },
+        ],
+    }
+
+def process_berkeley_nectar(example):
+    # input 1 return 
+    converted_sample = defaultdict(list)
+    # because batched=True
+    prompt = example["prompt"][0]
+    answers = example["answers"][0]
+    # already sorted (too much C_7^2=21)
+    # for comp_idx1, comp_idx2 in combinations(range(len(answers)), 2):
+    #     ans1, ans2 = answers[comp_idx1], answers[comp_idx2]
+    #     converted_sample["prompt"].append(prompt)
+    #     converted_sample["chosen"].append(ans1['answer'])
+    #     converted_sample["rejected"].append(ans2['answer'])
+    for idx in range(2):
+        for comp_idx2 in range(3, len(answers)):
+            ans1, ans2 = answers[idx], answers[comp_idx2]
+            converted_sample["prompt"].append(prompt)
+            converted_sample["chosen"].append([
+                {
+                    "from": "user",
+                    "value": prompt,
+                },
+                {
+                    "from": "assistant",
+                    "value": ans1['answer'],
+                }
+            ])
+            converted_sample["rejected"].append([
+                {
+                    "from": "user",
+                    "value": prompt,
+                },
+                {
+                    "from": "assistant",
+                    "value": ans2['answer'],
+                }
+            ])
+    return converted_sample
+
+def get_datasets(
+    data_config,
+) :
+    ans = datasets.DatasetDict()
+    for mixer, mode in zip(
+        [data_config.train_dataset_mixer, data_config.eval_dataset_mixer],
+        ['train', 'test'],
+    ):
+        raw_datasets = []
+        for ds in mixer:
+            dataset = datasets.load_dataset(ds['path'], split=ds['split'])
+            dataset = dataset.select(range(int(ds['frac'] * len(dataset))))
+            if 'ultra' in ds['path']:
+                dataset = dataset.map(
+                    process_ultrachat,
+                    remove_columns=set(dataset.column_names) - set(["prompt", "chosen", "rejected"]),
+                    num_proc=preprocessing_num_workers,
+                )
+                print(dataset)
+            elif 'orca' in ds['path']:
+                dataset = dataset.map(
+                    process_intel_orca,
+                    remove_columns=set(dataset.column_names) - set(["prompt", "chosen", "rejected"]),
+                    num_proc=preprocessing_num_workers,
+                )
+                print(dataset)
+            elif 'Nectar' in ds['path']:
+                dataset = dataset.map(
+                    process_berkeley_nectar,
+                    batched=True,
+                    batch_size=1,
+                    remove_columns=set(dataset.column_names) - set(["prompt", "chosen", "rejected"]),
+                    num_proc=preprocessing_num_workers,
+                )
+                print(dataset)
+            else:
+                raise NotImplementedError
+            raw_datasets.append(dataset)
+        ans[mode] = datasets.concatenate_datasets(raw_datasets).shuffle(seed=42)
+
+    return ans
+
+def preprocess(
+    sources,
+    tokenizer: transformers.PreTrainedTokenizer,
+    max_len: int,
+    system_message: str = "",
+):
+    # TODO: not support system yet
+    roles = {"user": "<|im_start|>user", "assistant": "<|im_start|>assistant"} #  "system": '<|im_start|>system'
+
+    im_start = tokenizer.im_start_id
+    im_end = tokenizer.im_end_id
+    nl_tokens = tokenizer("\n").input_ids
+    _system = tokenizer("system").input_ids + nl_tokens
+
+    # Apply prompt templates
+    prompt_ids, prompt_targets = [], []
+    answer_ids, answer_targets = [], []
+    for i, source in enumerate(sources):
+        if source[0]["from"]=='system' or roles[source[0]["from"]] != roles["user"]:
+            source = source[1:]
+
+        input_id, target = [], []
+        system = (
+            [im_start]
+            + _system
+            + tokenizer(system_message).input_ids
+            + [im_end]
+            + nl_tokens
+        )
+        input_id += system
+        target += (
+            [im_start] + [IGNORE_TOKEN_ID] * (len(system) - 3) + [im_end] + nl_tokens
+        )
+        assert len(input_id) == len(target)
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            _input_id = (
+                tokenizer(role).input_ids
+                + nl_tokens
+                + tokenizer(sentence["value"]).input_ids
+                + [im_end]
+                + nl_tokens
+            )
+            input_id += _input_id
+            if role == "<|im_start|>user":
+                _target = (
+                    [im_start]
+                    + [IGNORE_TOKEN_ID] * (len(_input_id) - 3)
+                    + [im_end]
+                    + nl_tokens
+                )
+                prompt_ids.append(input_id[:])
+                prompt_targets.append((target + _target)[:])
+            elif role == "<|im_start|>assistant":
+                _target = (
+                    [im_start]
+                    + [IGNORE_TOKEN_ID] * len(tokenizer(role).input_ids)
+                    + _input_id[len(tokenizer(role).input_ids) + 1 : -2]
+                    + [im_end]
+                    + nl_tokens
+                )
+                answer_ids.append(_input_id[:])
+                answer_targets.append(_target[:])
+            else:
+                raise NotImplementedError
+            target += _target
+        assert len(input_id) == len(target)
+        assert len(prompt_ids[-1]) == len(prompt_targets[-1])
+        assert len(answer_ids[-1]) == len(answer_targets[-1])
+
+    prompt_sequence_tokens = dict(
+        input_ids=prompt_ids,
+        labels=prompt_targets,
+        attention_mask=[
+            [id != tokenizer.pad_token_id for id in ids] for ids in prompt_ids
+        ],
+    )
+    answer_sequence_tokens = dict(
+        input_ids=answer_ids,
+        labels=answer_targets,
+        attention_mask=[
+            [id != tokenizer.pad_token_id for id in ids] for ids in answer_ids
+        ],
+    )
+    return prompt_sequence_tokens, answer_sequence_tokens
+
+def tokenize_row_chatml(self, feature, model = None) :
     batch = {}
     prompt = feature["prompt"]
     chosen = feature["chosen"]
     rejected = feature["rejected"]
 
-    if not self.is_encoder_decoder:
-        # Check issues below for more details
-        #  1. https://github.com/huggingface/trl/issues/907
-        #  2. https://github.com/EleutherAI/lm-evaluation-harness/pull/531#issuecomment-1595586257
-        #  3. https://github.com/LianjiaTech/BELLE/issues/337
+    prompt_tokens, chosen_tokens = preprocess(
+        [chosen], self.tokenizer, self.max_length
+    )
+    _, rejected_tokens = preprocess(
+        [rejected], self.tokenizer, self.max_length
+    )
 
-        if not isinstance(prompt, str):
-            raise ValueError(f"prompt should be an str but got {type(prompt)}")
-        prompt_tokens = self.tokenizer(prompt, add_special_tokens=False)
-        prompt_tokens = {f"prompt_{k}": v for k, v in prompt_tokens.items()}
+    prompt_tokens = {k: v[0] for k, v in prompt_tokens.items()}
+    chosen_tokens = {k: v[0] for k, v in chosen_tokens.items()}
+    rejected_tokens = {k: v[0] for k, v in rejected_tokens.items()}
 
-        if not isinstance(chosen, str):
-            raise ValueError(f"chosen should be an str but got {type(chosen)}")
-        chosen_tokens = self.build_tokenized_answer(prompt, chosen)
+    eos_token_id = self.tokenizer.eos_token_id
+    # Get indices in list prompt_tokens["input_ids"] that equals the EOS token (often 0)
+    eos_indices_prompt = [
+        i for i, x in enumerate(prompt_tokens["input_ids"]) if x == eos_token_id
+    ]
+    # attention mask these indices to eos_token_id
+    new_attention_mask = [
+        0 if i in eos_indices_prompt else p
+        for i, p in enumerate(prompt_tokens["attention_mask"])
+    ]
+    prompt_tokens["attention_mask"] = new_attention_mask
 
-        if not isinstance(rejected, str):
-            raise ValueError(f"rejected should be an str but got {type(rejected)}")
-        rejected_tokens = self.build_tokenized_answer(prompt, rejected)
+    # do the same for chosen and rejected
+    eos_indices_chosen = [
+        i for i, x in enumerate(chosen_tokens["input_ids"]) if x == eos_token_id
+    ]
+    new_attention_mask_c = [
+        0 if i in eos_indices_chosen else p
+        for i, p in enumerate(chosen_tokens["attention_mask"])
+    ]
+    chosen_tokens["attention_mask"] = new_attention_mask_c
 
-        # add BOS token to head of prompt (for qwen is None)
-        # prompt_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + prompt_tokens["prompt_input_ids"]
-        # chosen_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + chosen_tokens["prompt_input_ids"]
-        # rejected_tokens["prompt_input_ids"] = [self.tokenizer.bos_token_id] + rejected_tokens["prompt_input_ids"]
-        prompt_tokens["prompt_input_ids"] =  prompt_tokens["prompt_input_ids"]
-        chosen_tokens["prompt_input_ids"] =  chosen_tokens["prompt_input_ids"]
-        rejected_tokens["prompt_input_ids"] =  rejected_tokens["prompt_input_ids"]
+    eos_indices_rejected = [
+        i for i, x in enumerate(rejected_tokens["input_ids"]) if x == eos_token_id
+    ]
+    new_attention_mask_r = [
+        0 if i in eos_indices_rejected else p
+        for i, p in enumerate(rejected_tokens["attention_mask"])
+    ]
+    rejected_tokens["attention_mask"] = new_attention_mask_r
 
-        # prompt_tokens["prompt_attention_mask"] = [1] + prompt_tokens["prompt_attention_mask"]
-        # chosen_tokens["prompt_attention_mask"] = [1] + chosen_tokens["prompt_attention_mask"]
-        # rejected_tokens["prompt_attention_mask"] = [1] + rejected_tokens["prompt_attention_mask"]
+    # add EOS token to end of answer
+    chosen_tokens["input_ids"].append(self.tokenizer.eos_token_id)
+    chosen_tokens["attention_mask"].append(True)
 
-        # add EOS token to end of answer
-        chosen_tokens["input_ids"].append(self.tokenizer.eos_token_id)
-        chosen_tokens["attention_mask"].append(1)
+    rejected_tokens["input_ids"].append(self.tokenizer.eos_token_id)
+    rejected_tokens["attention_mask"].append(True)
 
-        rejected_tokens["input_ids"].append(self.tokenizer.eos_token_id)
-        rejected_tokens["attention_mask"].append(1)
+    longer_response_length = max(len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"]))
 
-        longer_response_length = max(len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"]))
-
-        # if combined sequence is too long, truncate the prompt
-        for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
-            if len(answer_tokens["prompt_input_ids"]) + longer_response_length > self.max_length:
-                if self.truncation_mode == "keep_start":
-                    for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][: self.max_prompt_length]
-                elif self.truncation_mode == "keep_end":
-                    for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][-self.max_prompt_length :]
-                else:
-                    raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
-
-        # if that's still too long, truncate the response
-        for answer_tokens in [chosen_tokens, rejected_tokens]:
-            if len(answer_tokens["prompt_input_ids"]) + longer_response_length > self.max_length:
+    # if combined sequence is too long, truncate the prompt
+    for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
+        if len(answer_tokens["input_ids"]) + longer_response_length > self.max_length:
+            if self.truncation_mode == "keep_start":
                 for k in ["input_ids", "attention_mask"]:
-                    answer_tokens[k] = answer_tokens[k][: self.max_length - self.max_prompt_length]
+                    answer_tokens[k] = answer_tokens[k][: self.max_prompt_length]
+            elif self.truncation_mode == "keep_end":
+                for k in ["input_ids", "attention_mask"]:
+                    answer_tokens[k] = answer_tokens[k][-self.max_prompt_length :]
+            else:
+                raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
 
-        # Create labels
-        chosen_sequence_tokens = {
-            k: chosen_tokens[f"prompt_{k}"] + chosen_tokens[k] for k in ["input_ids", "attention_mask"]
-        }
-        rejected_sequence_tokens = {
-            k: rejected_tokens[f"prompt_{k}"] + rejected_tokens[k] for k in ["input_ids", "attention_mask"]
-        }
-        chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
-        chosen_sequence_tokens["labels"][: len(chosen_tokens["prompt_input_ids"])] = [
-            self.label_pad_token_id
-        ] * len(chosen_tokens["prompt_input_ids"])
-        rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
-        rejected_sequence_tokens["labels"][: len(rejected_tokens["prompt_input_ids"])] = [
-            self.label_pad_token_id
-        ] * len(rejected_tokens["prompt_input_ids"])
+    # if that's still too long, truncate the response
+    for answer_tokens in [chosen_tokens, rejected_tokens]:
+        if len(answer_tokens["input_ids"]) + longer_response_length > self.max_length:
+            for k in ["input_ids", "attention_mask"]:
+                answer_tokens[k] = answer_tokens[k][: self.max_length - self.max_prompt_length]
 
-        for k, toks in {
-            "chosen_": chosen_sequence_tokens,
-            "rejected_": rejected_sequence_tokens,
-            "": prompt_tokens,
-        }.items():
-            for type_key, tokens in toks.items():
-                if type_key == "token_type_ids":
-                    continue
-                batch[f"{k}{type_key}"] = tokens
-
-    else:
-        chosen_tokens = self.tokenizer(
-            chosen, truncation=True, max_length=self.max_target_length, add_special_tokens=True
-        )
-        rejected_tokens = self.tokenizer(
-            rejected, truncation=True, max_length=self.max_target_length, add_special_tokens=True
-        )
-        prompt_tokens = self.tokenizer(
-            prompt, truncation=True, max_length=self.max_prompt_length, add_special_tokens=True
-        )
-
-        batch["chosen_labels"] = chosen_tokens["input_ids"]
-        batch["rejected_labels"] = rejected_tokens["input_ids"]
-        batch["prompt_input_ids"] = prompt_tokens["input_ids"]
-        batch["prompt_attention_mask"] = prompt_tokens["attention_mask"]
-
-        if model is not None and hasattr(model, "prepare_decoder_input_ids_from_labels"):
-            batch["rejected_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                labels=batch["rejected_labels"]
-            )
-            batch["chosen_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
-                labels=batch["chosen_labels"]
-            )
+    # Create labels
+    chosen_tokens = {k: prompt_tokens[k] + chosen_tokens[k] for k in ["input_ids", "attention_mask"]}
+    rejected_tokens = {
+        k: prompt_tokens[k] + rejected_tokens[k] for k in ["input_ids", "attention_mask"]
+    }
+    chosen_tokens["labels"] = chosen_tokens["input_ids"][:]
+    chosen_tokens["labels"][: len(prompt_tokens["input_ids"])] = [
+        IGNORE_TOKEN_ID
+    ] * len(prompt_tokens["input_ids"])
+    rejected_tokens["labels"] = rejected_tokens["input_ids"][:]
+    rejected_tokens["labels"][: len(prompt_tokens["input_ids"])] = [
+        IGNORE_TOKEN_ID
+    ] * len(prompt_tokens["input_ids"])
+    for k, toks in {
+        "chosen_": chosen_tokens,
+        "rejected_": rejected_tokens,
+        "": prompt_tokens,
+    }.items():
+        for type_key, tokens in toks.items():
+            if type_key == "token_type_ids":
+                continue
+            batch[f"{k}{type_key}"] = tokens
 
     return batch
-
 
 def main():
     parser = H4ArgumentParser((ModelArguments, DataArguments, DPOConfig))
     model_args, data_args, training_args = parser.parse()
     training_args.hub_private_repo = True
     training_args.ddp_find_unused_parameters=False
-
+    global preprocessing_num_workers
+    preprocessing_num_workers = data_args.preprocessing_num_workers
     #######
     # Setup
     #######
@@ -180,12 +377,14 @@ def main():
     ###############
     # Load datasets
     ###############
-    raw_datasets = get_datasets(data_args, data_args.dataset_splits)
+    raw_datasets = get_datasets(data_args)
     logger.info(
         f"Training on the following splits: {[split + ' : ' + str(dset.num_rows) for split, dset in raw_datasets.items()]}"
     )
-    column_names = list(raw_datasets["train"].features)
-
+    # for split in ["train", "test"]:
+    #     raw_datasets[split] = raw_datasets[split].remove_columns(
+    #         [col for col in raw_datasets[split].features if col not in ['prompt', 'chosen', 'rejected']]
+    #     )
     #####################################
     # Load tokenizer and process datasets
     #####################################
@@ -216,21 +415,42 @@ def main():
     #####################
     # Apply chat template
     #####################
-    raw_datasets = raw_datasets.map(
-        apply_chat_template,
-        fn_kwargs={"tokenizer": tokenizer, "task": "dpo"},
-        num_proc=data_args.preprocessing_num_workers,
-        remove_columns=column_names,
-        desc="Formatting comparisons with prompt template",
-    )
-
+    # raw_datasets = raw_datasets.map(
+    #     apply_chat_template,
+    #     fn_kwargs={"tokenizer": tokenizer, "task": "dpo"},
+    #     num_proc=data_args.preprocessing_num_workers,
+    #     remove_columns= list(raw_datasets["train"].features)
+    #     desc="Formatting comparisons with prompt template",
+    # )
     # Replace column names with what TRL needs, 
     # text_chosen -> chosen  
     # text_rejected -> rejected
-    for split in ["train", "test"]:
-        raw_datasets[split] = raw_datasets[split].rename_columns(
-            {"text_prompt": "prompt", "text_chosen": "chosen", "text_rejected": "rejected"}
-        )
+    # for split in ["train", "test"]:
+    #     raw_datasets[split] = raw_datasets[split].rename_columns(
+    #         {"text_prompt": "prompt", "text_chosen": "chosen", "text_rejected": "rejected"}
+    #     )
+
+    if 'qwen' in model_args.model_name_or_path:
+        # no BOS token; apply chatml format
+        setattr(DPOTrainer, 'tokenize_row', tokenize_row_chatml)
+        # for debug:
+        if os.getenv('DEBUG', False):
+            class DataDebugger:
+                def __init__(self, dataset, tokenizer,max_length,max_prompt_length):
+                    self.max_length = max_length
+                    self.max_prompt_length = max_prompt_length
+                    self.tokenizer = tokenizer
+                    self.truncation_mode = 'keep_end'
+                    self.dataset = dataset.select(range(1000)).map(self.tokenize_row, num_proc=1)
+
+            setattr(DataDebugger, 'tokenize_row', tokenize_row_chatml)
+
+            dpo_trainer = DataDebugger(
+                dataset=raw_datasets['train'],
+                tokenizer=tokenizer,
+                max_length=training_args.max_length,
+                max_prompt_length=training_args.max_prompt_length,
+            )
 
     torch_dtype = (
         model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
@@ -250,11 +470,11 @@ def main():
 
     model_kwargs = dict(
         revision=model_args.model_revision,
-        trust_remote_code=model_args.trust_remote_code,
         use_flash_attention_2=model_args.use_flash_attention_2,
         torch_dtype=torch_dtype,
         use_cache=False if training_args.gradient_checkpointing else True,
         quantization_config=quantization_config,
+        trust_remote_code=True
     )
 
     model = model_args.model_name_or_path
@@ -293,10 +513,6 @@ def main():
         model = model.merge_and_unload(progressbar=True)
         model_kwargs = None
 
-    if 'qwen-v1219' in model_args.model_name_or_path:
-        # no BOS token
-        setattr(DPOTrainer, 'tokenize_row', tokenize_row_without_bos)
-
     ref_model = model
     ref_model_kwargs = model_kwargs
 
@@ -319,6 +535,7 @@ def main():
         tokenizer=tokenizer,
         max_length=training_args.max_length,
         max_prompt_length=training_args.max_prompt_length,
+        truncation_mode="keep_end",
         peft_config=get_peft_config(model_args),
     )
 

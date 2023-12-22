@@ -189,7 +189,11 @@ class DataArguments:
     """
 
     chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
-    dataset_mixer: Optional[Dict[str, float]] = field(
+    train_dataset_mixer: Optional[Dict[str, float]] = field(
+        default=None,
+        metadata={"help": ("Datasets and their proportions to be used for training ift/rl.")},
+    )
+    eval_dataset_mixer: Optional[Dict[str, float]] = field(
         default=None,
         metadata={"help": ("Datasets and their proportions to be used for training ift/rl.")},
     )
