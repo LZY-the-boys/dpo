@@ -22,13 +22,15 @@ from transformers import AutoModelForCausalLM, set_seed, AutoTokenizer, BitsAndB
 from accelerate import Accelerator
 from configs import DataArguments, DPOConfig, H4ArgumentParser, ModelArguments, SFTConfig
 from data import apply_chat_template, get_datasets
-from model_utils import get_kbit_device_map, get_peft_config, is_adapter_model, DEFAULT_CHAT_TEMPLATE
-from peft import PeftConfig, PeftModel
+from model_utils import get_kbit_device_map, is_adapter_model, DEFAULT_CHAT_TEMPLATE
+from peft import LoraConfig, PeftConfig, PeftModel,prepare_model_for_kbit_training
 from trl import DPOTrainer
 import datasets
 from itertools import combinations
 from collections import defaultdict
 import numpy as np
+import random
+import re
 
 IGNORE_TOKEN_ID = -100
 preprocessing_num_workers = 1
@@ -80,8 +82,43 @@ def process_berkeley_nectar(example):
     # input 1 return 
     converted_sample = defaultdict(list)
     # because batched=True
+    turns = example['turns'][0]
     prompt = example["prompt"][0]
+    # may has many turns; 
     answers = example["answers"][0]
+    # adopted different format, you can either input history in one turn by: \n\nHuman(User): \n\nAssistant ; or chat multiple turn
+    history = []
+    rand = random.random()
+    if rand < 0.1:
+        prompt = prompt.replace('Human', 'User')
+    elif rand > 0.2:
+        if turns == 1:
+            # 里边有很多不属于分隔符的Human Assistant 混杂, 无法直接re.split
+            prompt = re.sub('^\n\nHuman: +', '', prompt)
+            prompt = re.sub('\n\nAssistant: +$', '', prompt)
+        else:
+            conversation = re.split(r'\n\nHuman: +|\n\nAssistant: +',prompt)
+            conversation = [d for d in conversation if d != '']
+            if len(conversation) % 2 :
+                prompt = prompt[-1]
+                user = conversation[1:-1:2]
+                bot = conversation[2::2]
+                for u,b in zip(user,bot):
+                    history.append({
+                        "from": "user",
+                        "value": u,
+                    })
+                    history.append({
+                        "from": "assistant",
+                        "value": b,
+                    })
+            else:
+                # 有十几条assistant连在一起的数据, 直接不处理
+                pass
+    history.append({
+        "from": "user",
+        "value": prompt,
+    })
     # already sorted (too much C_7^2=21)
     # for comp_idx1, comp_idx2 in combinations(range(len(answers)), 2):
     #     ans1, ans2 = answers[comp_idx1], answers[comp_idx2]
@@ -92,21 +129,13 @@ def process_berkeley_nectar(example):
         for comp_idx2 in range(3, len(answers)):
             ans1, ans2 = answers[idx], answers[comp_idx2]
             converted_sample["prompt"].append(prompt)
-            converted_sample["chosen"].append([
-                {
-                    "from": "user",
-                    "value": prompt,
-                },
+            converted_sample["chosen"].append(history + [
                 {
                     "from": "assistant",
                     "value": ans1['answer'],
                 }
             ])
-            converted_sample["rejected"].append([
-                {
-                    "from": "user",
-                    "value": prompt,
-                },
+            converted_sample["rejected"].append(history+[
                 {
                     "from": "assistant",
                     "value": ans2['answer'],
@@ -174,7 +203,10 @@ def preprocess(
     prompt_ids, prompt_targets = [], []
     answer_ids, answer_targets = [], []
     for i, source in enumerate(sources):
-        if source[0]["from"]=='system' or roles[source[0]["from"]] != roles["user"]:
+        if source[0]["from"]=='system':
+            system_message = source[0]['value']
+            source = source[1:]
+        if roles[source[0]["from"]] != roles["user"]:
             source = source[1:]
 
         input_id, target = [], []
@@ -254,10 +286,14 @@ def tokenize_row_chatml(self, feature, model = None) :
     _, rejected_tokens = preprocess(
         [rejected], self.tokenizer, self.max_length
     )
-
-    prompt_tokens = {k: v[0] for k, v in prompt_tokens.items()}
-    chosen_tokens = {k: v[0] for k, v in chosen_tokens.items()}
-    rejected_tokens = {k: v[0] for k, v in rejected_tokens.items()}
+    if os.getenv('DEBUG', False) and random.random() < 0.1:
+        print('prompt',self.tokenizer.batch_decode(prompt_tokens['input_ids']))
+        print('chosen',self.tokenizer.batch_decode(chosen_tokens['input_ids']))
+        print('rejected',self.tokenizer.batch_decode(rejected_tokens['input_ids']))
+    # for multi turn dataset, it generate multiple data item end with each resp 
+    prompt_tokens = {k: v[-1] for k, v in prompt_tokens.items()}
+    chosen_tokens = {k: v[-1] for k, v in chosen_tokens.items()}
+    rejected_tokens = {k: v[-1] for k, v in rejected_tokens.items()}
 
     eos_token_id = self.tokenizer.eos_token_id
     # Get indices in list prompt_tokens["input_ids"] that equals the EOS token (often 0)
@@ -290,7 +326,7 @@ def tokenize_row_chatml(self, feature, model = None) :
     ]
     rejected_tokens["attention_mask"] = new_attention_mask_r
 
-    # add EOS token to end of answer
+    # TODO: add EOS token to end of answer
     chosen_tokens["input_ids"].append(self.tokenizer.eos_token_id)
     chosen_tokens["attention_mask"].append(True)
 
@@ -468,15 +504,6 @@ def main():
             load_in_8bit=True,
         )
 
-    model_kwargs = dict(
-        revision=model_args.model_revision,
-        use_flash_attention_2=model_args.use_flash_attention_2,
-        torch_dtype=torch_dtype,
-        use_cache=False if training_args.gradient_checkpointing else True,
-        quantization_config=quantization_config,
-        trust_remote_code=True
-    )
-
     model = model_args.model_name_or_path
     if is_adapter_model(model, model_args.model_revision):
         # load the model, merge the adapter weights and unload the adapter
@@ -512,13 +539,41 @@ def main():
         model.eval()
         model = model.merge_and_unload(progressbar=True)
         model_kwargs = None
+    else:
+        # BUG: 直接送模型name给trl dpotrainer初始化有梯度错误，暂未查出原因
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            device_map={'': int(os.getenv('LOCAL_RANK',0))},
+            revision=model_args.model_revision,
+            use_flash_attention_2=model_args.use_flash_attention_2,
+            torch_dtype=torch_dtype,
+            use_cache=False if training_args.gradient_checkpointing else True,
+            quantization_config=quantization_config,
+            trust_remote_code=True
+        )
 
     ref_model = model
-    ref_model_kwargs = model_kwargs
+    # ref_model_kwargs = model_kwargs
 
     if model_args.use_peft is True:
         ref_model = None
         ref_model_kwargs = None
+
+        peft_config = LoraConfig(
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=model_args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=model_args.lora_target_modules,
+            modules_to_save=model_args.lora_modules_to_save,
+        )
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=training_args.gradient_checkpointing
+        )
+
+        if training_args.gradient_checkpointing:
+            model.enable_input_require_grads()
 
     #########################
     # Instantiate DPO trainer
@@ -526,7 +581,7 @@ def main():
     dpo_trainer = DPOTrainer(
         model,
         ref_model,
-        model_init_kwargs=model_kwargs,
+        # model_init_kwargs=model_kwargs,
         ref_model_init_kwargs=ref_model_kwargs,
         args=training_args,
         beta=training_args.beta,
@@ -536,9 +591,20 @@ def main():
         max_length=training_args.max_length,
         max_prompt_length=training_args.max_prompt_length,
         truncation_mode="keep_end",
-        peft_config=get_peft_config(model_args),
+        peft_config=peft_config if model_args.use_peft else None,
+        # gradient_checkpointing_kwargs=training_args.gradient_checkpointing_kwargs,
     )
-
+    if os.getenv('DEBUG', False):
+        logger.info([ (n,p.dtype) for n,p in dpo_trainer.model.named_parameters() ])
+        logger.info([ n for n,p in dpo_trainer.model.named_parameters() if p.requires_grad ])
+        requires_grad = []
+        for name, param in dpo_trainer.model.named_parameters(recurse=True):
+            if param.requires_grad:
+                requires_grad.append(f"{name}: {param.requires_grad}")
+        if len(requires_grad) == 0:
+            logger.error("there are no parameters that require gradient updates")
+    # no use 
+    delattr(dpo_trainer.model.model.base_model.__class__.__bases__[0], '_set_gradient_checkpointing')
     ###############
     # Training loop
     ###############

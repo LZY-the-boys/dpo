@@ -1,6 +1,6 @@
 # Model arguments
-model_name_or_path: /data/outs/qwen-v1221
-# model_name_or_path: lu-vae/qwen-v1221-merged
+# model_name_or_path: /data/outs/qwen-v1221
+model_name_or_path: lu-vae/qwen-v1221-merged
 # model_name_or_path: alignment-handbook/zephyr-7b-sft-lora
 torch_dtype: auto
 
@@ -60,7 +60,8 @@ output_dir: /data/outs/qwen-v1221-dpo-lora # It is handy to append `hub_model_re
 per_device_train_batch_size: 4
 per_device_eval_batch_size: 4
 push_to_hub: true
-save_strategy: "no"
+save_strategy: "steps"
+save_steps: 200
 save_total_limit: null
 seed: 42
 warmup_ratio: 0.1
