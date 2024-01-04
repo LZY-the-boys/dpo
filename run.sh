@@ -1,12 +1,12 @@
 source activate lla
 export PYTHONPATH=.
-
+# 0,1,2,3,4,5,6,7
 # WANDB_MODE=disabled \
-WANDB_DISABLED=False \
-CUDA_VISIBLE_DEVICES=4,5,6,7 \
+WANDB_DISABLED=True \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 accelerate launch --main_process_port $(shuf -i25000-30000 -n1) \
 run_dpo.py \
-config_lora.yaml \
+v1231.yaml \
 --load_in_4bit=true
 
 # accelerate launch --main_process_port 25002 --num_processes=1 \

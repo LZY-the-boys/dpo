@@ -1,6 +1,6 @@
 # Model arguments
 # model_name_or_path: /data/outs/qwen-v1221
-model_name_or_path: lu-vae/qwen-v1221-merged
+model_name_or_path: Qwen/Qwen-14B-Chat
 # model_name_or_path: alignment-handbook/zephyr-7b-sft-lora
 torch_dtype: auto
 
@@ -27,9 +27,9 @@ train_dataset_mixer:
     frac: 1.0
     split: train
   # 182 k
-  - path: berkeley-nest/Nectar
-    frac: 0.4
-    split: train
+  # - path: berkeley-nest/Nectar
+  #   frac: 0.2
+  #   split: train
 eval_dataset_mixer:
   - path: HuggingFaceH4/ultrafeedback_binarized
     frac: 0.2
@@ -43,21 +43,21 @@ beta: 0.1
 do_eval: false
 evaluation_strategy: epoch
 eval_steps: 100
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
 hub_model_id: 
-learning_rate: 5.0e-7
+learning_rate: 1.0e-5
 log_level: info
 logging_steps: 10
 lr_scheduler_type: linear
-max_length: 1024
-max_prompt_length: 512
+max_length: 2048
+max_prompt_length: 1024
 num_train_epochs: 3
 optim: rmsprop
-output_dir: /data/outs/qwen-v1221-dpo-lora # It is handy to append `hub_model_revision` to keep track of your local experiments
-per_device_train_batch_size: 4
+output_dir: /data/outs/qwen-chat-dpo-lora # It is handy to append `hub_model_revision` to keep track of your local experiments
+per_device_train_batch_size: 2
 per_device_eval_batch_size: 4
 push_to_hub: true
 save_strategy: "steps"
